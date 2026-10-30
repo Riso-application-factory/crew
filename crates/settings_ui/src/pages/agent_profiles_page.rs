@@ -10,11 +10,10 @@ use convert_case::{Case, Casing as _};
 use editor::Editor;
 use fs::Fs;
 use gpui::{
-    Context, Entity, Focusable as _, ScrollHandle, SharedString, Subscription, Task, Window,
-    prelude::*,
+    Context, Entity, EntityId, Focusable as _, ScrollHandle, SharedString, Subscription, Task,
+    Window, prelude::*,
 };
 use language_model::{LanguageModel, LanguageModelProviderId, LanguageModelRegistry};
-use project::Project;
 use settings::{
     AgentProfileContent, LanguageModelProviderSetting, LanguageModelSelection, Settings as _,
     update_settings_file,
@@ -56,8 +55,10 @@ pub(crate) struct AgentProfilePageState {
 /// project it was built from. Creating a registry sends `tools/list` and
 /// `prompts/list` to every running MCP server, so detail-page visits for one
 /// project share a single registry instead of re-registering each time.
+/// Dropped as soon as no agent-profiles page remains on the stack, so the
+/// registry and its observe subscription only live while the feature is open.
 pub(crate) struct AgentProfileContextServers {
-    project: Entity<Project>,
+    project_id: EntityId,
     registry: Entity<ContextServerRegistry>,
     _subscription: Subscription,
 }
@@ -205,7 +206,7 @@ fn open_agent_profile_detail_page(
         &settings_window.agent_profile_context_servers,
         &active_project,
     ) {
-        (Some(cache), Some(project)) => cache.project.entity_id() == project.entity_id(),
+        (Some(cache), Some(project)) => cache.project_id == project.entity_id(),
         _ => false,
     };
     if !cache_is_current {
@@ -214,7 +215,7 @@ fn open_agent_profile_detail_page(
                 .new(|cx| ContextServerRegistry::new(project.read(cx).context_server_store(), cx));
             let subscription = cx.observe(&registry, |_, _, cx| cx.notify());
             AgentProfileContextServers {
-                project,
+                project_id: project.entity_id(),
                 registry,
                 _subscription: subscription,
             }
@@ -882,11 +883,44 @@ fn save_agent_profile_form(
 /// flips `awaiting_creation` when a just-created profile lands in
 /// `AgentSettings`, and pops the detail/form sub-pages when the tracked
 /// profile disappears (e.g. deleted through the modal or settings.json).
+///
+/// First reconciles state with `sub_page_stack`: nav paths that replace the
+/// stack (`navigate_to_setting`, `navigate_to_skill_creator`, `build_ui`, nav
+/// entry selection) bypass `pop_sub_page`, so page state must follow the
+/// stack rather than individual pop sites.
 pub(crate) fn sync_agent_profile_page_state(
     settings_window: &mut SettingsWindow,
     window: &mut Window,
     cx: &mut Context<SettingsWindow>,
 ) {
+    // The list page carries a description; detail pages write to JSON
+    // (in_json) and forms don't.
+    let mut has_detail_page = false;
+    let mut has_form_page = false;
+    let mut has_any_page = false;
+    for sub_page in &settings_window.sub_page_stack {
+        if sub_page.link.json_path != Some(AGENT_PROFILES_JSON_PATH) {
+            continue;
+        }
+        has_any_page = true;
+        if sub_page.link.description.is_none() {
+            if sub_page.link.in_json {
+                has_detail_page = true;
+            } else {
+                has_form_page = true;
+            }
+        }
+    }
+    if !has_detail_page {
+        settings_window.agent_profile_page = None;
+    }
+    if !has_form_page {
+        settings_window.agent_profile_form = None;
+    }
+    if !has_any_page {
+        settings_window.agent_profile_context_servers = None;
+    }
+
     let Some(state) = settings_window.agent_profile_page.as_mut() else {
         return;
     };
@@ -1609,6 +1643,68 @@ mod tests {
             sync_agent_profile_page_state(this, window, cx);
             // The half-typed form survives — nothing of the deleted profile
             // is on the stack anymore.
+            let form = this.agent_profile_form.as_ref().expect("form state");
+            assert_eq!(form.name.read(cx).text(cx), "Half Typed");
+            let titles: Vec<String> = this
+                .sub_page_stack
+                .iter()
+                .map(|sub_page| sub_page.link.title.to_string())
+                .collect();
+            assert_eq!(titles, ["Agent Profiles", "Add Profile"]);
+        });
+    }
+
+    #[gpui::test]
+    async fn deleting_profile_after_nav_clear_keeps_form(cx: &mut TestAppContext) {
+        let fs = init_agent_profile_test(
+            cx,
+            r#"{"agent": {"profiles": {"victim": {"name": "Victim"}}}}"#,
+        )
+        .await;
+
+        let cx = cx.add_empty_window();
+        let settings_window = cx.update(|window, cx| cx.new(|cx| SettingsWindow::test(window, cx)));
+
+        settings_window.update_in(cx, |this, window, cx| {
+            this.push_sub_page(list_page_link(), "Agent Configuration".into(), window, cx);
+            open_agent_profile_detail_page(
+                this,
+                profile_id("victim"),
+                false,
+                "Victim".into(),
+                window,
+                cx,
+            );
+            // Navigating to another settings page clears the stack directly,
+            // bypassing pop_sub_page and leaving the state stale.
+            this.sub_page_stack.clear();
+
+            // Returning to Agent Profiles and opening the form.
+            this.push_sub_page(list_page_link(), "Agent Configuration".into(), window, cx);
+            open_agent_profile_form(this, None, window, cx);
+            let form = this.agent_profile_form.as_ref().expect("form state");
+            form.name.update(cx, |editor, cx| {
+                editor.set_text("Half Typed", window, cx);
+            });
+        });
+
+        cx.update(|_window, cx| {
+            update_settings_file(fs.clone(), cx, |settings, _cx| {
+                if let Some(profiles) = settings
+                    .agent
+                    .as_mut()
+                    .and_then(|agent| agent.profiles.as_mut())
+                {
+                    profiles.shift_remove("victim");
+                }
+            });
+        });
+        cx.run_until_parked();
+
+        settings_window.update_in(cx, |this, window, cx| {
+            sync_agent_profile_page_state(this, window, cx);
+            // The stale detail state was dropped before it could pop the
+            // half-typed form.
             let form = this.agent_profile_form.as_ref().expect("form state");
             assert_eq!(form.name.read(cx).text(cx), "Half Typed");
             let titles: Vec<String> = this
