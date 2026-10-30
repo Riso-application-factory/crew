@@ -6,7 +6,7 @@ use language_model::{LanguageModel, LanguageModelRegistry};
 use picker::{Picker, PickerDelegate};
 use ui::{ListItem, ListItemSpacing, PopoverMenu, PopoverMenuHandle, prelude::*};
 
-use crate::render_picker_trigger_button;
+use crate::{render_picker_trigger_button, wire_picker_trigger_a11y};
 
 type LanguageModelPicker = Picker<LanguageModelPickerDelegate>;
 
@@ -27,9 +27,9 @@ fn all_models(cx: &App) -> Vec<LanguageModel> {
     }
     for provider in &providers {
         for model in provider.provided_models(cx) {
-            let already_recommended = models
-                .iter()
-                .any(|m| m.provider_id() == model.provider_id() && m.id() == model.id());
+            let already_recommended = models.iter().any(|existing| {
+                existing.provider_id() == model.provider_id() && existing.id() == model.id()
+            });
             if !already_recommended {
                 models.push(model);
             }
@@ -196,11 +196,12 @@ pub fn render_language_model_picker(
     let handle = PopoverMenuHandle::default();
 
     PopoverMenu::new("language-model-picker")
-        .trigger(
+        .trigger(wire_picker_trigger_a11y(
             render_picker_trigger_button("language_model_picker_trigger".into(), trigger_label)
                 .disabled(disabled)
                 .aria_label("Default Model"),
-        )
+            handle.clone(),
+        ))
         .menu(move |window, cx| {
             let on_select = on_select.clone();
             let current_model = current_model.clone();

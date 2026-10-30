@@ -1,4 +1,5 @@
 use std::sync::Arc;
+use std::time::Duration;
 
 use agent::ContextServerRegistry;
 use agent_settings::{
@@ -9,9 +10,11 @@ use convert_case::{Case, Casing as _};
 use editor::Editor;
 use fs::Fs;
 use gpui::{
-    Context, Entity, Focusable as _, ScrollHandle, SharedString, Subscription, Window, prelude::*,
+    Context, Entity, Focusable as _, ScrollHandle, SharedString, Subscription, Task, Window,
+    prelude::*,
 };
 use language_model::{LanguageModel, LanguageModelProviderId, LanguageModelRegistry};
+use project::Project;
 use settings::{
     AgentProfileContent, LanguageModelProviderSetting, LanguageModelSelection, Settings as _,
     update_settings_file,
@@ -38,14 +41,30 @@ pub(crate) struct AgentProfilePageState {
     /// Set for a detail page opened right after Save: the profile must not be
     /// treated as deleted until the create write lands in `AgentSettings`.
     awaiting_creation: bool,
-    context_server_registry: Option<Entity<ContextServerRegistry>>,
-    _registry_subscription: Option<Subscription>,
+    /// Set when `awaiting_creation` outlives `PROFILE_CREATE_TIMEOUT` without
+    /// the profile reaching `AgentSettings` — the create write failed.
+    creation_failed: bool,
+    creation_timeout: Option<Task<()>>,
     // D5: each "… Configured" telemetry event fires at most once per detail
     // page opening, on the first write of that section.
     tools_configured_sent: bool,
     mcps_configured_sent: bool,
     default_model_configured_sent: bool,
 }
+
+/// `ContextServerRegistry` for agent profile detail pages, keyed by the
+/// project it was built from. Creating a registry sends `tools/list` and
+/// `prompts/list` to every running MCP server, so detail-page visits for one
+/// project share a single registry instead of re-registering each time.
+pub(crate) struct AgentProfileContextServers {
+    project: Entity<Project>,
+    registry: Entity<ContextServerRegistry>,
+    _subscription: Subscription,
+}
+
+/// How long a detail page waits for `AgentProfile::create`'s settings write to
+/// land in `AgentSettings` before reporting failure.
+const PROFILE_CREATE_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Editor-backed state of the active add/fork profile form sub-page.
 pub(crate) struct AgentProfileForm {
@@ -64,10 +83,6 @@ fn builtin_profile_description(profile_id: &AgentProfileId) -> Option<&'static s
         _ => None,
     }
 }
-
-// ---------------------------------------------------------------------------
-// List page
-// ---------------------------------------------------------------------------
 
 pub(crate) fn render_agent_profiles_page(
     _settings_window: &SettingsWindow,
@@ -177,10 +192,6 @@ fn render_dashed_note(text: &'static str, cx: &App) -> AnyElement {
         .into_any_element()
 }
 
-// ---------------------------------------------------------------------------
-// Detail page
-// ---------------------------------------------------------------------------
-
 fn open_agent_profile_detail_page(
     settings_window: &mut SettingsWindow,
     profile_id: AgentProfileId,
@@ -189,12 +200,44 @@ fn open_agent_profile_detail_page(
     window: &mut Window,
     cx: &mut Context<SettingsWindow>,
 ) {
-    let context_server_registry = settings_window.active_project(cx).map(|project| {
-        cx.new(|cx| ContextServerRegistry::new(project.read(cx).context_server_store(), cx))
+    let active_project = settings_window.active_project(cx);
+    let cache_is_current = match (
+        &settings_window.agent_profile_context_servers,
+        &active_project,
+    ) {
+        (Some(cache), Some(project)) => cache.project.entity_id() == project.entity_id(),
+        _ => false,
+    };
+    if !cache_is_current {
+        settings_window.agent_profile_context_servers = active_project.map(|project| {
+            let registry = cx
+                .new(|cx| ContextServerRegistry::new(project.read(cx).context_server_store(), cx));
+            let subscription = cx.observe(&registry, |_, _, cx| cx.notify());
+            AgentProfileContextServers {
+                project,
+                registry,
+                _subscription: subscription,
+            }
+        });
+    }
+
+    let creation_timeout = awaiting_creation.then(|| {
+        cx.spawn_in(window, async move |this, cx| {
+            cx.background_executor().timer(PROFILE_CREATE_TIMEOUT).await;
+            this.update(cx, |this, cx| {
+                if let Some(state) = this.agent_profile_page.as_mut()
+                    && state.awaiting_creation
+                    && !AgentSettings::get_global(cx)
+                        .profiles
+                        .contains_key(&state.profile_id)
+                {
+                    state.creation_failed = true;
+                    cx.notify();
+                }
+            })
+            .ok();
+        })
     });
-    let registry_subscription = context_server_registry
-        .as_ref()
-        .map(|registry| cx.observe(registry, |_, _, cx| cx.notify()));
 
     let title = AgentSettings::get_global(cx)
         .profiles
@@ -206,8 +249,8 @@ fn open_agent_profile_detail_page(
         profile_id,
         pending_name,
         awaiting_creation,
-        context_server_registry,
-        _registry_subscription: registry_subscription,
+        creation_failed: false,
+        creation_timeout,
         tools_configured_sent: false,
         mcps_configured_sent: false,
         default_model_configured_sent: false,
@@ -235,8 +278,12 @@ fn render_agent_profile_detail_page(
     };
     let profile_id = state.profile_id.clone();
     let awaiting_creation = state.awaiting_creation;
+    let creation_failed = state.creation_failed;
     let pending_name = state.pending_name.clone();
-    let context_server_registry = state.context_server_registry.clone();
+    let context_server_registry = settings_window
+        .agent_profile_context_servers
+        .as_ref()
+        .map(|cache| cache.registry.clone());
 
     let profile = AgentSettings::get_global(cx)
         .profiles
@@ -266,6 +313,7 @@ fn render_agent_profile_detail_page(
             display_name,
             is_builtin,
             saving,
+            creation_failed,
             controls_disabled,
             cx,
         ))
@@ -302,6 +350,7 @@ fn render_general_section(
     display_name: SharedString,
     is_builtin: bool,
     saving: bool,
+    creation_failed: bool,
     controls_disabled: bool,
     cx: &mut Context<SettingsWindow>,
 ) -> AnyElement {
@@ -351,17 +400,35 @@ fn render_general_section(
                                 .on_click(cx.listener(move |this, _, window, cx| {
                                     let fs = <dyn Fs>::global(cx);
                                     delete_agent_profile(fs, delete_profile_id.clone(), cx);
-                                    this.agent_profile_page = None;
                                     this.pop_sub_page(window, cx);
                                 })),
                         ),
                 ),
         )
-        .when(saving, |this| {
+        .when(saving && !creation_failed, |this| {
             this.child(
                 Label::new("Saving profile…")
                     .size(LabelSize::Small)
                     .color(Color::Muted),
+            )
+        })
+        .when(creation_failed, |this| {
+            this.child(
+                h_flex()
+                    .gap_2()
+                    .items_center()
+                    .child(
+                        Label::new("Failed to save the profile.")
+                            .size(LabelSize::Small)
+                            .color(Color::Error),
+                    )
+                    .child(
+                        Button::new("agent-profile-back", "Back to Profiles")
+                            .style(ButtonStyle::OutlinedGhost)
+                            .on_click(cx.listener(|this, _, window, cx| {
+                                this.pop_sub_page(window, cx);
+                            })),
+                    ),
             )
         })
         .into_any_element()
@@ -539,7 +606,7 @@ fn render_mcp_tools_section(
             cx,
         )
     } else {
-        let servers: Vec<(ContextServerId, Vec<SharedString>)> = context_server_registry
+        let mut servers: Vec<(ContextServerId, Vec<SharedString>)> = context_server_registry
             .map(|registry| {
                 registry
                     .read(cx)
@@ -550,6 +617,9 @@ fn render_mcp_tools_section(
                     .collect()
             })
             .unwrap_or_default();
+        // `servers()` iterates a HashMap — sort so sections keep a stable
+        // order across registry reloads.
+        servers.sort_by(|left, right| left.0.0.as_ref().cmp(right.0.0.as_ref()));
         if servers.is_empty() {
             render_dashed_note("No running MCP servers with tools.", cx)
         } else {
@@ -609,10 +679,6 @@ fn render_mcp_tools_section(
         .into_any_element()
 }
 
-// ---------------------------------------------------------------------------
-// Add/fork form
-// ---------------------------------------------------------------------------
-
 /// Opens the add-profile (`base_profile_id = None`) or fork form sub-page.
 pub(crate) fn open_agent_profile_form(
     settings_window: &mut SettingsWindow,
@@ -670,10 +736,12 @@ fn profile_name_error(name: &str, cx: &App) -> Option<SharedString> {
         return Some("Name is required.".into());
     }
     let id = profile_id_from_name(name);
-    if !id.chars().any(|c| c.is_alphanumeric())
-        || AgentSettings::get_global(cx)
-            .profiles
-            .contains_key(&AgentProfileId(id.as_str().into()))
+    if !id.chars().any(|character| character.is_alphanumeric()) {
+        return Some("Name must contain at least one letter or number.".into());
+    }
+    if AgentSettings::get_global(cx)
+        .profiles
+        .contains_key(&AgentProfileId(id.as_str().into()))
     {
         return Some("A profile with this ID already exists.".into());
     }
@@ -785,8 +853,21 @@ fn save_agent_profile_form(
         base_profile_id = base_profile_id.as_ref().map(|id| id.as_str())
     );
 
-    settings_window.agent_profile_form = None;
     settings_window.pop_sub_page(window, cx);
+    // When forking, the base profile's detail page sits under the form. The
+    // stack may hold only one detail page — all of them render from the
+    // single `agent_profile_page` state — so pop profile pages until the
+    // registered list page (which carries a description) is back on top.
+    while settings_window
+        .sub_page_stack
+        .last()
+        .is_some_and(|sub_page| {
+            sub_page.link.json_path == Some(AGENT_PROFILES_JSON_PATH)
+                && sub_page.link.description.is_none()
+        })
+    {
+        settings_window.pop_sub_page(window, cx);
+    }
     open_agent_profile_detail_page(
         settings_window,
         profile_id,
@@ -796,10 +877,6 @@ fn save_agent_profile_form(
         cx,
     );
 }
-
-// ---------------------------------------------------------------------------
-// SettingsStore synchronization
-// ---------------------------------------------------------------------------
 
 /// Called from `SettingsWindow`'s `SettingsStore` observer before re-render:
 /// flips `awaiting_creation` when a just-created profile lands in
@@ -818,6 +895,8 @@ pub(crate) fn sync_agent_profile_page_state(
         .contains_key(&state.profile_id)
     {
         state.awaiting_creation = false;
+        state.creation_failed = false;
+        state.creation_timeout = None;
         return;
     }
     if state.awaiting_creation {
@@ -826,7 +905,8 @@ pub(crate) fn sync_agent_profile_page_state(
     settings_window.agent_profile_page = None;
     settings_window.agent_profile_form = None;
     // Registered pages carry a description; the dynamic detail/form pages of
-    // this feature never do. Pop everything of ours above the list page.
+    // this feature never do. Pop everything of ours above the list page —
+    // popping a detail or form page also clears its state in `pop_sub_page`.
     while settings_window
         .sub_page_stack
         .last()
@@ -838,10 +918,6 @@ pub(crate) fn sync_agent_profile_page_state(
         settings_window.pop_sub_page(window, cx);
     }
 }
-
-// ---------------------------------------------------------------------------
-// Settings writes (called by UI handlers and directly by tests)
-// ---------------------------------------------------------------------------
 
 /// Applies `write` to the profile inside the user settings file. When the
 /// profile is not yet saved there (e.g. an untouched built-in), it is first
@@ -979,10 +1055,6 @@ fn delete_agent_profile(fs: Arc<dyn Fs>, profile_id: AgentProfileId, cx: &App) {
         }
     });
 }
-
-// ---------------------------------------------------------------------------
-// Telemetry (once per section per detail-page opening — D5)
-// ---------------------------------------------------------------------------
 
 fn mark_tools_configured(settings_window: &mut SettingsWindow, profile_id: &AgentProfileId) {
     let Some(state) = settings_window.agent_profile_page.as_mut() else {
@@ -1351,10 +1423,10 @@ mod tests {
                 profile_name_error("   ", cx).as_deref(),
                 Some("Name is required.")
             );
-            // A name that kebab-cases to an empty id.
+            // A name that kebab-cases to an id without alphanumerics.
             assert_eq!(
                 profile_name_error("!!!", cx).as_deref(),
-                Some("A profile with this ID already exists.")
+                Some("Name must contain at least one letter or number.")
             );
             // "Write" kebab-cases to the existing built-in id.
             assert_eq!(
@@ -1438,6 +1510,143 @@ mod tests {
             // treated as "profile deleted" and popped.
             assert!(this.agent_profile_page.is_some());
             assert_eq!(this.sub_page_stack.len(), 2);
+        });
+    }
+
+    #[gpui::test]
+    async fn fork_from_detail_replaces_detail_page(cx: &mut TestAppContext) {
+        init_agent_profile_test(cx, r#"{"agent": {"profiles": {"base": {"name": "Base"}}}}"#).await;
+
+        let cx = cx.add_empty_window();
+        let settings_window = cx.update(|window, cx| cx.new(|cx| SettingsWindow::test(window, cx)));
+
+        settings_window.update_in(cx, |this, window, cx| {
+            this.push_sub_page(list_page_link(), "Agent Configuration".into(), window, cx);
+            open_agent_profile_detail_page(
+                this,
+                profile_id("base"),
+                false,
+                "Base".into(),
+                window,
+                cx,
+            );
+            open_agent_profile_form(this, Some(profile_id("base")), window, cx);
+            assert_eq!(this.sub_page_stack.len(), 3);
+
+            let form = this.agent_profile_form.as_ref().expect("form state");
+            form.name.update(cx, |editor, cx| {
+                editor.set_text("Forked", window, cx);
+            });
+            save_agent_profile_form(this, window, cx);
+
+            // The stack holds list + the fork's detail page — not the base's.
+            let titles: Vec<String> = this
+                .sub_page_stack
+                .iter()
+                .map(|sub_page| sub_page.link.title.to_string())
+                .collect();
+            assert_eq!(titles, ["Agent Profiles", "Forked"]);
+            let state = this.agent_profile_page.as_ref().expect("page state");
+            assert_eq!(state.profile_id, profile_id("forked"));
+        });
+        cx.run_until_parked();
+
+        // Going back lands on the list page and drops the detail state.
+        settings_window.update_in(cx, |this, window, cx| {
+            this.pop_sub_page(window, cx);
+            assert!(this.agent_profile_page.is_none());
+            assert_eq!(this.sub_page_stack.len(), 1);
+        });
+    }
+
+    #[gpui::test]
+    async fn deleting_profile_does_not_close_unrelated_form(cx: &mut TestAppContext) {
+        let fs = init_agent_profile_test(
+            cx,
+            r#"{"agent": {"profiles": {"victim": {"name": "Victim"}}}}"#,
+        )
+        .await;
+
+        let cx = cx.add_empty_window();
+        let settings_window = cx.update(|window, cx| cx.new(|cx| SettingsWindow::test(window, cx)));
+
+        settings_window.update_in(cx, |this, window, cx| {
+            this.push_sub_page(list_page_link(), "Agent Configuration".into(), window, cx);
+            open_agent_profile_detail_page(
+                this,
+                profile_id("victim"),
+                false,
+                "Victim".into(),
+                window,
+                cx,
+            );
+            // Leaving the detail page must drop its state.
+            this.pop_sub_page(window, cx);
+            assert!(this.agent_profile_page.is_none());
+
+            open_agent_profile_form(this, None, window, cx);
+            let form = this.agent_profile_form.as_ref().expect("form state");
+            form.name.update(cx, |editor, cx| {
+                editor.set_text("Half Typed", window, cx);
+            });
+        });
+
+        // The visited profile is deleted elsewhere while the form is open.
+        cx.update(|_window, cx| {
+            update_settings_file(fs.clone(), cx, |settings, _cx| {
+                if let Some(profiles) = settings
+                    .agent
+                    .as_mut()
+                    .and_then(|agent| agent.profiles.as_mut())
+                {
+                    profiles.shift_remove("victim");
+                }
+            });
+        });
+        cx.run_until_parked();
+
+        settings_window.update_in(cx, |this, window, cx| {
+            sync_agent_profile_page_state(this, window, cx);
+            // The half-typed form survives — nothing of the deleted profile
+            // is on the stack anymore.
+            let form = this.agent_profile_form.as_ref().expect("form state");
+            assert_eq!(form.name.read(cx).text(cx), "Half Typed");
+            let titles: Vec<String> = this
+                .sub_page_stack
+                .iter()
+                .map(|sub_page| sub_page.link.title.to_string())
+                .collect();
+            assert_eq!(titles, ["Agent Profiles", "Add Profile"]);
+        });
+    }
+
+    #[gpui::test]
+    async fn failed_create_reports_error_after_timeout(cx: &mut TestAppContext) {
+        init_agent_profile_test(cx, "{}").await;
+
+        let cx = cx.add_empty_window();
+        let settings_window = cx.update(|window, cx| cx.new(|cx| SettingsWindow::test(window, cx)));
+
+        settings_window.update_in(cx, |this, window, cx| {
+            this.push_sub_page(list_page_link(), "Agent Configuration".into(), window, cx);
+            // A detail page whose create write never lands (e.g. the file
+            // update failed before reaching disk).
+            open_agent_profile_detail_page(
+                this,
+                profile_id("stuck"),
+                true,
+                "Stuck".into(),
+                window,
+                cx,
+            );
+        });
+
+        cx.executor().advance_clock(PROFILE_CREATE_TIMEOUT);
+        cx.run_until_parked();
+
+        settings_window.update_in(cx, |this, _window, _cx| {
+            let state = this.agent_profile_page.as_ref().expect("page state");
+            assert!(state.creation_failed);
         });
     }
 }

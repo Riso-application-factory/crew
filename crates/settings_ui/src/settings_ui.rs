@@ -1017,6 +1017,9 @@ pub struct SettingsWindow {
     pub(crate) agent_profile_page: Option<AgentProfilePageState>,
     /// State for the active add/fork agent profile form sub-page, if open.
     pub(crate) agent_profile_form: Option<AgentProfileForm>,
+    /// `ContextServerRegistry` shared by agent profile detail pages, keyed by
+    /// the active project.
+    pub(crate) agent_profile_context_servers: Option<pages::AgentProfileContextServers>,
 }
 
 struct SearchDocument {
@@ -2042,6 +2045,7 @@ impl SettingsWindow {
             skill_creator_page: None,
             agent_profile_page: None,
             agent_profile_form: None,
+            agent_profile_context_servers: None,
         };
 
         this.fetch_files(window, cx);
@@ -4583,10 +4587,21 @@ impl SettingsWindow {
     pub(crate) fn pop_sub_page(&mut self, window: &mut Window, cx: &mut Context<SettingsWindow>) {
         self.regex_validation_error = None;
         self.sandbox_host_validation_error = None;
-        if let Some(popped) = self.sub_page_stack.pop()
-            && popped.link.r#type == SubPageType::SkillCreator
-        {
-            self.skill_creator_page = None;
+        if let Some(popped) = self.sub_page_stack.pop() {
+            if popped.link.r#type == SubPageType::SkillCreator {
+                self.skill_creator_page = None;
+            }
+            // Detail (in_json) and form agent profile pages render from shared
+            // state fields; popping a page must drop the state that drives it.
+            if popped.link.json_path == Some(pages::AGENT_PROFILES_JSON_PATH)
+                && popped.link.description.is_none()
+            {
+                if popped.link.in_json {
+                    self.agent_profile_page = None;
+                } else {
+                    self.agent_profile_form = None;
+                }
+            }
         }
         self.retry_llm_provider_authentication(cx);
         self.content_focus_handle.focus_handle(cx).focus(window, cx);
@@ -5266,7 +5281,7 @@ fn render_picker_trigger_button(id: SharedString, label: SharedString) -> Button
 /// Wires the Expand/Collapse accessibility actions on a picker trigger button to
 /// the popover handle, so assistive technology can open and close the picker
 /// (used by UIA on Windows and AX on macOS; Linux/AT-SPI uses the click action).
-fn wire_picker_trigger_a11y<M: gpui::ManagedView>(
+pub(crate) fn wire_picker_trigger_a11y<M: gpui::ManagedView>(
     button: Button,
     handle: ui::PopoverMenuHandle<M>,
 ) -> Button {
@@ -5537,6 +5552,7 @@ pub mod test {
                 skill_creator_page: None,
                 agent_profile_page: None,
                 agent_profile_form: None,
+                agent_profile_context_servers: None,
             }
         }
     }
@@ -5679,6 +5695,7 @@ pub mod test {
             skill_creator_page: None,
             agent_profile_page: None,
             agent_profile_form: None,
+            agent_profile_context_servers: None,
         };
 
         settings_window.build_filter_table();

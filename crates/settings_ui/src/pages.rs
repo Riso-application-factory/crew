@@ -12,8 +12,8 @@ mod skills_setup;
 mod tool_permissions_setup;
 
 pub(crate) use agent_profiles_page::{
-    AgentProfileForm, AgentProfilePageState, open_agent_profile_form, render_agent_profiles_page,
-    sync_agent_profile_page_state,
+    AGENT_PROFILES_JSON_PATH, AgentProfileContextServers, AgentProfileForm, AgentProfilePageState,
+    open_agent_profile_form, render_agent_profiles_page, sync_agent_profile_page_state,
 };
 pub(crate) use audio_input_output_setup::{
     render_input_audio_device_dropdown, render_output_audio_device_dropdown,

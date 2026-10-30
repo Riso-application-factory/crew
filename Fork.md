@@ -64,6 +64,10 @@ unchanged.
   on the first write of that section; the modal fires on screen open.
 - D6: the add/fork form rejects empty names, symbol-only names (kebab id has
   no alphanumeric) and duplicate ids; the modal accepts them.
+- The built-in tools list is not filtered by
+  `agent::tool_supports_provider` (the modal's `active_model = None` path):
+  when a native thread has a model selected, the modal's tool picker hides
+  provider-unsupported tools and this page shows them.
 - The built-in one-line descriptions duplicate `ProfileSelector::
   documentation` to keep `settings_ui` independent of `agent_ui`.
 
