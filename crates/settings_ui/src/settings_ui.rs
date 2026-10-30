@@ -2554,6 +2554,7 @@ impl SettingsWindow {
             self.build_content_handles(window, cx);
         }
         self.sub_page_stack.clear();
+        pages::reconcile_agent_profile_state(self);
         // PERF: doesn't have to be rebuilt, can just be filled with true. pages is constant once it is built
         self.build_filter_table();
         self.reset_list_state();
@@ -2682,6 +2683,7 @@ impl SettingsWindow {
         }
 
         self.sub_page_stack.clear();
+        pages::reconcile_agent_profile_state(self);
     }
 
     fn open_best_matching_nav_page(&mut self, query_words: &[&str]) {
@@ -4492,6 +4494,7 @@ impl SettingsWindow {
         cx: &mut Context<SettingsWindow>,
     ) {
         self.sub_page_stack.clear();
+        pages::reconcile_agent_profile_state(self);
         let skills_page_index = self.pages.iter().position(|page| {
             page.items.iter().any(|item| {
                 matches!(
@@ -4552,6 +4555,7 @@ impl SettingsWindow {
         cx: &mut Context<SettingsWindow>,
     ) -> bool {
         self.sub_page_stack.clear();
+        pages::reconcile_agent_profile_state(self);
 
         for (page_index, page) in self.pages.iter().enumerate() {
             for (item_index, item) in page.items.iter().enumerate() {
@@ -4591,18 +4595,8 @@ impl SettingsWindow {
             if popped.link.r#type == SubPageType::SkillCreator {
                 self.skill_creator_page = None;
             }
-            // Detail (in_json) and form agent profile pages render from shared
-            // state fields; popping a page must drop the state that drives it.
-            if popped.link.json_path == Some(pages::AGENT_PROFILES_JSON_PATH)
-                && popped.link.description.is_none()
-            {
-                if popped.link.in_json {
-                    self.agent_profile_page = None;
-                } else {
-                    self.agent_profile_form = None;
-                }
-            }
         }
+        pages::reconcile_agent_profile_state(self);
         self.retry_llm_provider_authentication(cx);
         self.content_focus_handle.focus_handle(cx).focus(window, cx);
         cx.notify();
