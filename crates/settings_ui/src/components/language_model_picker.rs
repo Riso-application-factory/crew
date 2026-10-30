@@ -7,7 +7,7 @@ use gpui::{
 };
 use itertools::Itertools as _;
 use language_model::{LanguageModel, LanguageModelProviderId, LanguageModelRegistry};
-use picker::{Picker, PickerDelegate};
+use picker::{Picker, PickerDelegate, ScrollBehavior};
 use project::{
     AgentId, Project,
     external_agent_models::{
@@ -239,6 +239,15 @@ fn matches_for_query(items: &[PickerItem], query: &str) -> Vec<StringMatch> {
         .collect()
 }
 
+/// One-shot state `on_catalog_changed` leaves for the `update_matches`
+/// call the observer makes right after: the highlight decision, and the
+/// highlighted row's identity captured before `items` was rebuilt — the
+/// stale `filtered_items` indices only resolve against the old `items`.
+struct PendingHighlight {
+    prefer_current_selection: bool,
+    previous_identity: Option<(SharedString, SharedString)>,
+}
+
 struct LanguageModelPickerDelegate {
     items: Vec<PickerItem>,
     filtered_items: Vec<StringMatch>,
@@ -249,6 +258,7 @@ struct LanguageModelPickerDelegate {
     /// Whether the user moved the highlight since the picker opened — gates
     /// the "re-highlight the selection match" behavior on catalog changes.
     user_moved_highlight: bool,
+    pending_highlight: Option<PendingHighlight>,
     current_selection: Option<LanguageModelSelection>,
     project: Option<Entity<Project>>,
     catalog: Option<Entity<ExternalAgentModelCatalog>>,
@@ -261,6 +271,7 @@ impl LanguageModelPickerDelegate {
         current_selection: Option<LanguageModelSelection>,
         project: Option<Entity<Project>>,
         on_select: Rc<dyn Fn(PickerModel, &mut App) + 'static>,
+        window: &mut Window,
         cx: &mut Context<LanguageModelPicker>,
     ) -> Self {
         // Opening the picker is the only trigger that refreshes the catalog
@@ -269,8 +280,21 @@ impl LanguageModelPickerDelegate {
             .as_ref()
             .and_then(|project| refresh_external_agent_models(project, cx));
         let subscription = catalog.as_ref().map(|catalog| {
-            cx.observe(catalog, |this, _catalog, cx| {
-                this.delegate.on_catalog_changed(cx);
+            cx.observe_in(catalog, window, |picker, _catalog, window, cx| {
+                let prefer_current_selection = picker.delegate.on_catalog_changed(cx);
+                let query = picker.delegate.query.clone();
+                // Route through `update_matches_with_options` so the picker's
+                // `matches_updated` scrolls the re-highlighted row into view.
+                picker.update_matches_with_options(
+                    query,
+                    if prefer_current_selection {
+                        ScrollBehavior::RevealSelected
+                    } else {
+                        ScrollBehavior::PreserveOffset
+                    },
+                    window,
+                    cx,
+                );
             })
         });
         let items = build_items(project.as_ref(), catalog.as_ref(), cx);
@@ -279,7 +303,9 @@ impl LanguageModelPickerDelegate {
             .as_ref()
             .and_then(|selection| {
                 filtered_items.iter().position(|item_match| {
-                    items[item_match.candidate_id].matches_selection(selection)
+                    items
+                        .get(item_match.candidate_id)
+                        .is_some_and(|item| item.matches_selection(selection))
                 })
             })
             .unwrap_or(0);
@@ -290,6 +316,7 @@ impl LanguageModelPickerDelegate {
             selected_index,
             query: String::new(),
             user_moved_highlight: false,
+            pending_highlight: None,
             current_selection,
             project,
             catalog,
@@ -298,27 +325,41 @@ impl LanguageModelPickerDelegate {
         }
     }
 
-    /// A catalog change rebuilds the external section and re-runs the
-    /// current query. When the query is empty and the user has not moved
-    /// the highlight since opening, the selection match is highlighted
-    /// again — its row may have just arrived.
-    fn on_catalog_changed(&mut self, cx: &mut Context<LanguageModelPicker>) {
-        let prefer_current_selection = self.query.is_empty() && !self.user_moved_highlight;
+    /// A catalog change rebuilds the external section and reports whether
+    /// the follow-up refilter should prefer the `current_selection` match —
+    /// the case when the query is empty and the user has not moved the
+    /// highlight since opening (the matching row may have just arrived).
+    /// The refilter itself runs in `update_matches`, which the observer
+    /// invokes next so the picker scrolls to the re-picked row.
+    fn on_catalog_changed(&mut self, cx: &App) -> bool {
+        let previous_identity = self.highlight_identity();
         self.items = build_items(self.project.as_ref(), self.catalog.as_ref(), cx);
-        self.refilter(prefer_current_selection);
-        cx.notify();
+        let prefer_current_selection = self.query.is_empty() && !self.user_moved_highlight;
+        self.pending_highlight = Some(PendingHighlight {
+            prefer_current_selection,
+            previous_identity,
+        });
+        prefer_current_selection
+    }
+
+    /// The identity of the currently highlighted row, captured while
+    /// `filtered_items` and `items` still belong to the same build.
+    fn highlight_identity(&self) -> Option<(SharedString, SharedString)> {
+        self.filtered_items
+            .get(self.selected_index)
+            .and_then(|item_match| self.items.get(item_match.candidate_id))
+            .map(PickerItem::identity)
     }
 
     /// Re-run the filter and re-pick the highlighted row: the
     /// `current_selection` match when `prefer_current_selection` is set,
     /// otherwise the previously highlighted row kept by identity, falling
     /// back to row 0 when it left the filtered set.
-    fn refilter(&mut self, prefer_current_selection: bool) {
-        let previous_identity = self
-            .filtered_items
-            .get(self.selected_index)
-            .and_then(|item_match| self.items.get(item_match.candidate_id))
-            .map(PickerItem::identity);
+    fn refilter(
+        &mut self,
+        prefer_current_selection: bool,
+        previous_identity: Option<(SharedString, SharedString)>,
+    ) {
         self.filtered_items = matches_for_query(&self.items, &self.query);
 
         let current_match = self
@@ -327,14 +368,18 @@ impl LanguageModelPickerDelegate {
             .filter(|_| prefer_current_selection)
             .and_then(|selection| {
                 self.filtered_items.iter().position(|item_match| {
-                    self.items[item_match.candidate_id].matches_selection(selection)
+                    self.items
+                        .get(item_match.candidate_id)
+                        .is_some_and(|item| item.matches_selection(selection))
                 })
             });
         self.selected_index = current_match
             .or_else(|| {
                 previous_identity.and_then(|identity| {
                     self.filtered_items.iter().position(|item_match| {
-                        self.items[item_match.candidate_id].identity() == identity
+                        self.items
+                            .get(item_match.candidate_id)
+                            .is_some_and(|item| item.identity() == identity)
                     })
                 })
             })
@@ -394,8 +439,15 @@ impl PickerDelegate for LanguageModelPickerDelegate {
         _window: &mut Window,
         cx: &mut Context<LanguageModelPicker>,
     ) -> Task<()> {
+        // A catalog change leaves `pending_highlight` for this call; a plain
+        // typed query finds none and captures the identity from the still-
+        // consistent `filtered_items`/`items` instead.
+        let (prefer_current_selection, previous_identity) = match self.pending_highlight.take() {
+            Some(pending) => (pending.prefer_current_selection, pending.previous_identity),
+            None => (false, self.highlight_identity()),
+        };
         self.query = query;
-        self.refilter(false);
+        self.refilter(prefer_current_selection, previous_identity);
         cx.notify();
 
         Task::ready(())
@@ -520,7 +572,13 @@ pub fn render_language_model_picker(
             let project = project.clone();
             Some(cx.new(|cx| {
                 Picker::uniform_list(
-                    LanguageModelPickerDelegate::new(current_selection, project, on_select, cx),
+                    LanguageModelPickerDelegate::new(
+                        current_selection,
+                        project,
+                        on_select,
+                        window,
+                        cx,
+                    ),
                     window,
                     cx,
                 )
@@ -548,6 +606,7 @@ mod tests {
 
     use fs::{FakeFs, Fs};
     use gpui::{AsyncApp, TestAppContext, UpdateGlobal as _, VisualTestContext};
+    use language_model::fake_provider::FakeLanguageModelProvider;
     use project::ExternalAgentSource;
     use project::agent_server_store::{
         AgentServerCommand, ExternalAgentEntry, ExternalAgentServer,
@@ -562,7 +621,7 @@ mod tests {
     async fn init_picker_test(
         cx: &mut TestAppContext,
         agent_ids: &[&str],
-    ) -> (Arc<FakeFs>, Entity<Project>) {
+    ) -> (Arc<FakeFs>, Entity<Project>, Arc<FakeLanguageModelProvider>) {
         let fs = FakeFs::new(cx.background_executor.clone());
         fs.save(
             paths::settings_file().as_path(),
@@ -571,13 +630,13 @@ mod tests {
         )
         .await
         .expect("failed to save settings");
-        cx.update(|cx| {
+        let fake_provider = cx.update(|cx| {
             let settings_store = SettingsStore::test(cx);
             cx.set_global(settings_store);
             theme_settings::init(theme::LoadThemes::JustBase, cx);
             editor::init(cx);
             menu::init();
-            LanguageModelRegistry::test(cx);
+            let fake_provider = LanguageModelRegistry::test(cx);
             if !agent_ids.is_empty() {
                 SettingsStore::update_global(cx, |store, cx| {
                     store.update_user_settings(cx, |content| {
@@ -598,9 +657,10 @@ mod tests {
                     });
                 });
             }
+            fake_provider
         });
         let project = Project::test(fs.clone(), [], cx).await;
-        (fs, project)
+        (fs, project, fake_provider)
     }
 
     /// A `get_command` stub for directly inserted store entries — the picker
@@ -675,6 +735,7 @@ mod tests {
                         current_selection,
                         project,
                         Rc::new(move |model, _cx| received.borrow_mut().push(model)),
+                        window,
                         cx,
                     ),
                     window,
@@ -693,7 +754,13 @@ mod tests {
                 .delegate
                 .filtered_items
                 .iter()
-                .map(|item_match| picker.delegate.items[item_match.candidate_id].filter_text())
+                .filter_map(|item_match| {
+                    picker
+                        .delegate
+                        .items
+                        .get(item_match.candidate_id)
+                        .map(PickerItem::filter_text)
+                })
                 .collect()
         })
     }
@@ -714,7 +781,7 @@ mod tests {
 
     #[gpui::test]
     async fn external_models_follow_zed_in_display_name_order(cx: &mut TestAppContext) {
-        let (_fs, project) = init_picker_test(cx, &["zeta-agent", "alpha-agent"]).await;
+        let (_fs, project, _provider) = init_picker_test(cx, &["zeta-agent", "alpha-agent"]).await;
         install_named_agent(&project, "zzz-custom", "Aardvark", cx);
 
         cx.update(|cx| {
@@ -772,7 +839,7 @@ mod tests {
 
     #[gpui::test]
     async fn ready_empty_and_agent_with_no_state_yield_no_rows(cx: &mut TestAppContext) {
-        let (_fs, project) = init_picker_test(cx, &["empty-agent", "ghost-agent"]).await;
+        let (_fs, project, _provider) = init_picker_test(cx, &["empty-agent", "ghost-agent"]).await;
         cx.update(|cx| {
             set_external_agent_model_source(
                 |_project, catalog, cx| {
@@ -799,7 +866,7 @@ mod tests {
     async fn provider_id_collision_agent_is_excluded(cx: &mut TestAppContext) {
         // The fake provider registers under id "fake" — an agent with the
         // same id must not be listed (AD-11).
-        let (_fs, project) = init_picker_test(cx, &["fake", "clean-agent"]).await;
+        let (_fs, project, _provider) = init_picker_test(cx, &["fake", "clean-agent"]).await;
         cx.update(|cx| {
             set_external_agent_model_source(
                 |_project, catalog, cx| {
@@ -832,7 +899,7 @@ mod tests {
 
     #[gpui::test]
     async fn status_rows_are_not_selectable_and_confirm_does_not_dismiss(cx: &mut TestAppContext) {
-        let (_fs, project) =
+        let (_fs, project, _provider) =
             init_picker_test(cx, &["loading-agent", "auth-agent", "broken-agent"]).await;
         cx.update(|cx| {
             set_external_agent_model_source(
@@ -906,7 +973,7 @@ mod tests {
 
     #[gpui::test]
     async fn catalog_change_preserves_typed_query(cx: &mut TestAppContext) {
-        let (_fs, project) = init_picker_test(cx, &["model-agent"]).await;
+        let (_fs, project, _provider) = init_picker_test(cx, &["model-agent"]).await;
         cx.update(|cx| {
             set_external_agent_model_source(
                 |_project, catalog, cx| {
@@ -960,7 +1027,13 @@ mod tests {
 
     #[gpui::test]
     async fn selection_match_is_highlighted_when_model_arrives_late(cx: &mut TestAppContext) {
-        let (_fs, project) = init_picker_test(cx, &["late-agent"]).await;
+        let (_fs, project, provider) = init_picker_test(cx, &["late-agent"]).await;
+        // Enough Zed models that the external row lands below the 18rem
+        // viewport — the scroll assertion below only means something when
+        // the row starts off-screen.
+        for index in 0..30 {
+            provider.model(&format!("zed-model-{index:02}"));
+        }
         cx.update(|cx| {
             set_external_agent_model_source(
                 |_project, catalog, cx| {
@@ -1006,11 +1079,18 @@ mod tests {
             selected_label(&picker, cx).as_deref(),
             Some("late-agent/Model One")
         );
+        // …and the picker scrolled the off-screen row into view (the scroll
+        // target is the selected row, which sits after the 31 Zed rows).
+        picker.read_with(cx, |picker, _cx| {
+            let selected_index = picker.delegate.selected_index;
+            assert!(selected_index > 30, "external row should be off-screen");
+            assert_eq!(picker.logical_scroll_top_index(), selected_index);
+        });
     }
 
     #[gpui::test]
     async fn no_project_or_no_source_lists_zed_models_only(cx: &mut TestAppContext) {
-        let (_fs, project) = init_picker_test(cx, &["some-agent"]).await;
+        let (_fs, project, _provider) = init_picker_test(cx, &["some-agent"]).await;
         let cx = cx.add_empty_window();
 
         // No source registered at all — refresh returns None, so even with
