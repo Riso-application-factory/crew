@@ -203,25 +203,25 @@ async fn run_probe(
     project: Entity<Project>,
     cx: &mut AsyncApp,
 ) -> Result<Vec<ExternalAgentModel>> {
-    let connected = connection_wait
-        .await
-        .map_err(|error| anyhow::Error::new(error))?;
-
-    let (result_tx, result_rx) = oneshot::channel();
-    cx.spawn(async move |cx| {
-        let result = run_probe_session(connected.connection, project, cx).await;
-        result_tx.send(result).ok();
-    })
-    .detach();
-
     let timeout = cx.background_executor().timer(PROBE_TIMEOUT).fuse();
-    let result_rx = result_rx.fuse();
-    futures::pin_mut!(result_rx);
-    match futures::future::select(result_rx, timeout).await {
-        futures::future::Either::Left((Ok(result), _)) => result,
-        futures::future::Either::Left((Err(_sender_dropped), _)) => {
-            Err(anyhow!("probe session task was dropped"))
-        }
+    let probe = async {
+        let connected = connection_wait
+            .await
+            .map_err(|error| anyhow::Error::new(error))?;
+        let (result_tx, result_rx) = oneshot::channel();
+        cx.spawn(async move |cx| {
+            let result = run_probe_session(connected.connection, project, cx).await;
+            result_tx.send(result).ok();
+        })
+        .detach();
+        result_rx
+            .await
+            .map_err(|_| anyhow!("probe session task was dropped"))?
+    }
+    .fuse();
+    futures::pin_mut!(probe);
+    match futures::future::select(probe, timeout).await {
+        futures::future::Either::Left((result, _)) => result,
         futures::future::Either::Right(_) => Err(anyhow!("Timed out after 30 seconds")),
     }
 }
@@ -294,11 +294,10 @@ async fn close_probe_session(
 fn models_from_config_options(
     config_options: &dyn AgentSessionConfigOptions,
 ) -> Vec<ExternalAgentModel> {
-    let Some(option) = config_options
-        .config_options()
-        .into_iter()
-        .find(|option| option.category == Some(acp_v2::SessionConfigOptionCategory::Model))
-    else {
+    let Some(option) = config_options.config_options().into_iter().find(|option| {
+        option.category == Some(acp_v2::SessionConfigOptionCategory::Model)
+            && matches!(option.kind, acp_v2::SessionConfigKind::Select(_))
+    }) else {
         return Vec::new();
     };
     let acp_v2::SessionConfigKind::Select(select) = &option.kind else {
@@ -392,6 +391,7 @@ mod tests {
     };
     use action_log::ActionLog;
     use agent_client_protocol::schema::{v1 as acp_v1, v2 as acp};
+    use agent_servers::{AgentServer, AgentServerDelegate};
     use collections::IndexMap;
     use fs::FakeFs;
     use gpui::{AppContext as _, TestAppContext, UpdateGlobal, VisualTestContext};
@@ -792,6 +792,141 @@ mod tests {
     }
 
     #[gpui::test]
+    async fn hanging_connect_times_out_and_refresh_reuses_pending_entry(cx: &mut TestAppContext) {
+        let fs = FakeFs::new(cx.executor());
+        init_test(cx, fs.clone());
+        let project = Project::test(fs, [], cx).await;
+        install_custom_agent("hang-agent", cx);
+        let (window, _workspace, panel) = setup_workspace_with_panel(project.clone(), cx).await;
+        let cx = &mut VisualTestContext::from_window(window, cx);
+
+        let server = DeferredConnectServer::new(
+            CatalogTestConnection::new("hang-agent")
+                .with_model_list(AgentModelList::Flat(vec![stub_model("m", "M")])),
+        );
+        let release_connect = server.defer_next_connect();
+        panel
+            .read_with(cx, |panel, _cx| panel.connection_store().clone())
+            .update(cx, |store, cx| {
+                store.request_connection(
+                    Agent::Custom {
+                        id: AgentId::new("hang-agent"),
+                    },
+                    Rc::new(server.clone()),
+                    cx,
+                );
+            });
+        cx.run_until_parked();
+        assert_eq!(server.connect_call_count(), 1);
+
+        let catalog = refresh(&project, cx);
+        assert_eq!(
+            catalog_state(&catalog, "hang-agent", cx).as_deref(),
+            Some("loading")
+        );
+
+        cx.executor()
+            .advance_clock(PROBE_TIMEOUT + Duration::from_secs(1));
+        cx.run_until_parked();
+        assert_eq!(
+            catalog_state(&catalog, "hang-agent", cx).as_deref(),
+            Some("failed:Timed out after 30 seconds")
+        );
+
+        // The retry waits on the same pending connection-store entry; it
+        // must not spawn the agent again.
+        let catalog = refresh(&project, cx);
+        assert_eq!(server.connect_call_count(), 1);
+        assert_eq!(
+            catalog_state(&catalog, "hang-agent", cx).as_deref(),
+            Some("loading")
+        );
+
+        release_connect.send(()).expect("connect still pending");
+        cx.run_until_parked();
+        assert_eq!(
+            catalog_state(&catalog, "hang-agent", cx).as_deref(),
+            Some("ready")
+        );
+        assert_eq!(
+            ready_models(&catalog, "hang-agent", cx),
+            vec![("m".to_string(), "M".to_string(), None)]
+        );
+    }
+
+    #[gpui::test]
+    async fn refresh_skips_agents_whose_probe_is_loading(cx: &mut TestAppContext) {
+        let fs = FakeFs::new(cx.executor());
+        init_test(cx, fs.clone());
+        let project = Project::test(fs, [], cx).await;
+        install_custom_agent("catalog-agent", cx);
+        let (window, _workspace, panel) = setup_workspace_with_panel(project.clone(), cx).await;
+        let cx = &mut VisualTestContext::from_window(window, cx);
+
+        let connection = CatalogTestConnection::new("catalog-agent")
+            .with_model_list(AgentModelList::Flat(vec![stub_model("m", "M")]));
+        let release_session = connection.defer_next_new_session();
+        seed_connection(&panel, connection.clone(), cx);
+
+        let catalog = refresh(&project, cx);
+        assert_eq!(connection.new_session_call_count(), 1);
+        assert_eq!(
+            catalog_state(&catalog, "catalog-agent", cx).as_deref(),
+            Some("loading")
+        );
+
+        // Reopening the picker while the probe is in flight must not start
+        // a second session for that agent.
+        let catalog = refresh(&project, cx);
+        assert_eq!(connection.new_session_call_count(), 1);
+        assert_eq!(
+            catalog_state(&catalog, "catalog-agent", cx).as_deref(),
+            Some("loading")
+        );
+
+        release_session.send(Ok(())).expect("probe still waiting");
+        cx.run_until_parked();
+        assert_eq!(
+            catalog_state(&catalog, "catalog-agent", cx).as_deref(),
+            Some("ready")
+        );
+    }
+
+    #[gpui::test]
+    async fn agent_servers_updated_discards_in_flight_probe_result(cx: &mut TestAppContext) {
+        let fs = FakeFs::new(cx.executor());
+        init_test(cx, fs.clone());
+        let project = Project::test(fs, [], cx).await;
+        install_custom_agent("catalog-agent", cx);
+        let (window, _workspace, panel) = setup_workspace_with_panel(project.clone(), cx).await;
+        let cx = &mut VisualTestContext::from_window(window, cx);
+
+        let connection = CatalogTestConnection::new("catalog-agent").with_close_session();
+        let release_session = connection.defer_next_new_session();
+        seed_connection(&panel, connection.clone(), cx);
+
+        let catalog = refresh(&project, cx);
+        assert_eq!(connection.new_session_call_count(), 1);
+        assert_eq!(
+            catalog_state(&catalog, "catalog-agent", cx).as_deref(),
+            Some("loading")
+        );
+
+        // Uninstalling/changing agents mid-probe clears the catalog task; the
+        // detached session lifecycle must still close the session, but the
+        // late result must not be written back into the cleared catalog.
+        let agent_server_store =
+            project.read_with(cx, |project, _cx| project.agent_server_store().clone());
+        agent_server_store.update(cx, |_store, cx| cx.emit(AgentServersUpdated));
+        assert_eq!(catalog_state(&catalog, "catalog-agent", cx), None);
+
+        release_session.send(Ok(())).expect("probe still waiting");
+        cx.run_until_parked();
+        assert_eq!(connection.close_session_call_count(), 1);
+        assert_eq!(catalog_state(&catalog, "catalog-agent", cx), None);
+    }
+
+    #[gpui::test]
     async fn open_panel_session_supplies_models_without_new_session(cx: &mut TestAppContext) {
         let fs = FakeFs::new(cx.executor());
         init_test(cx, fs.clone());
@@ -1125,6 +1260,66 @@ mod tests {
         fn delete_session(&self, session_id: &acp::SessionId, _cx: &mut App) -> Task<Result<()>> {
             self.delete_calls.lock().push(session_id.clone());
             Task::ready(Ok(()))
+        }
+
+        fn into_any(self: Rc<Self>) -> Rc<dyn Any> {
+            self
+        }
+    }
+
+    #[derive(Clone)]
+    struct DeferredConnectServer {
+        connection: CatalogTestConnection,
+        connect_calls: Arc<AtomicUsize>,
+        deferred_connects: Arc<Mutex<VecDeque<oneshot::Receiver<()>>>>,
+    }
+
+    impl DeferredConnectServer {
+        fn new(connection: CatalogTestConnection) -> Self {
+            Self {
+                connection,
+                connect_calls: Arc::new(AtomicUsize::new(0)),
+                deferred_connects: Arc::new(Mutex::new(VecDeque::new())),
+            }
+        }
+
+        fn defer_next_connect(&self) -> oneshot::Sender<()> {
+            let (sender, receiver) = oneshot::channel();
+            self.deferred_connects.lock().push_back(receiver);
+            sender
+        }
+
+        fn connect_call_count(&self) -> usize {
+            self.connect_calls.load(Ordering::SeqCst)
+        }
+    }
+
+    impl AgentServer for DeferredConnectServer {
+        fn logo(&self) -> ui::IconName {
+            ui::IconName::ZedAgent
+        }
+
+        fn agent_id(&self) -> AgentId {
+            self.connection.agent_id()
+        }
+
+        fn connect(
+            &self,
+            _delegate: AgentServerDelegate,
+            _project: Entity<Project>,
+            cx: &mut App,
+        ) -> Task<Result<Rc<dyn AgentConnection>>> {
+            self.connect_calls.fetch_add(1, Ordering::SeqCst);
+            let connection = self.connection.clone();
+            if let Some(receiver) = self.deferred_connects.lock().pop_front() {
+                return cx.foreground_executor().spawn(async move {
+                    receiver
+                        .await
+                        .map_err(|_| anyhow!("connect sender dropped"))?;
+                    Ok(Rc::new(connection) as Rc<dyn AgentConnection>)
+                });
+            }
+            Task::ready(Ok(Rc::new(connection)))
         }
 
         fn into_any(self: Rc<Self>) -> Rc<dyn Any> {
