@@ -125,10 +125,8 @@ open `AgentPanel` sessions or short-lived probe sessions.
 
 - `crates/project/src/external_agent_models.rs` — `ExternalAgentModel`,
   `ExternalAgentModelsState`, `ExternalAgentModelCatalog`
-  (`state`/`set_state`/`set_task`/`ensure_store_subscription`/
-  `enable_refresh_on_agent_changes`), `AgentFingerprint` (settings +
-  registry version), `set_external_agent_model_source`,
-  `external_agent_model_catalog`, `subscribe_external_agent_models`,
+  (`state`/`set_state`/`set_task`), `set_external_agent_model_source`,
+  `external_agent_model_catalog`, `external_agent_model_catalog_or_init`,
   `refresh_external_agent_models`; a private
   `GlobalExternalAgentModelCatalogs` holding the single app-wide catalog.
 - `crates/agent_ui/src/external_agent_models.rs` — `init` (one call from
@@ -138,9 +136,14 @@ open `AgentPanel` sessions or short-lived probe sessions.
   `start_preload` (`App::observe_new::<AgentPanel>` trigger),
   `find_agent_panel` (`workspace::AppState` workspace scan),
   `probe_agent`/`run_probe`/`run_probe_session`/`read_models`/
-  `close_probe_session`/`archive_probe_session` helpers, and the
-  `CatalogTestConnection`/`CatalogTestConfigOptions`/`CatalogTestModelSelector`/
+  `probe_session_needs_archive`/`archive_probe_session` helpers,
+  `PROBE_SESSION_TITLE`, and the `CatalogTestConnection`/
+  `CatalogTestConfigOptions`/`CatalogTestModelSelector`/
   `CatalogTestSessionList`/`GatedFetchHttpClient` test types.
+- `crates/agent_ui/src/threads_archive_view.rs` —
+  `is_probe_session_metadata`, applied in `update_items` and in the
+  `archived_entries()` checks (`update_items` filter fallback and
+  `render_toolbar`'s `has_archived_threads`).
 
 **Upstream behaviors preserved.**
 
@@ -156,20 +159,29 @@ open `AgentPanel` sessions or short-lived probe sessions.
 **Intentional divergences.**
 
 - The catalog is app-wide: one `ExternalAgentModelCatalog` serves every
-  project and window. It subscribes to each local project's
-  `AgentServerStore` for `AgentServersUpdated`; non-local projects are never
-  subscribed, and a project's subscription is dropped when the project
-  entity is released.
-- `AgentServersUpdated` performs selective invalidation: a per-agent
-  `AgentFingerprint` (settings entry + registry version) is compared, and
-  only removed agents or agents whose fingerprint changed lose their state
-  and pending probe task. `enable_refresh_on_agent_changes` arms
-  re-invocation of the source after real changes; it stays off for
-  plain catalog reads/picker refreshes so they cannot drive probing.
-- On startup the catalog preloads once: the first `AgentPanel` for a local
-  project triggers it after `AgentRegistryStore::is_fetching` becomes
-  false (or immediately when no registry store exists), and only while AI
-  is enabled. Shared/collab and remote projects are never probed.
+  project and window. Entries change only when a probe or an open-thread
+  read writes them; the catalog does not observe `AgentServersUpdated` and
+  does not track installs, removals, or settings changes.
+- Refresh happens only at three points: the startup preload, opening the
+  profile detail/model picker for an agent with no result or a `Failed`
+  result, and reading models from an already-open external-agent thread.
+  `Ready`/`AuthRequired`/`Loading` entries are never reprobed; `Failed` is
+  retried on the next refresh.
+- Refresh is a no-op — no probes and no catalog writes — when the project
+  is shared/collab, when no `AgentPanel` exists for the project, or when
+  `DisableAiSettings` is on. Existing entries stay as they are. Remote
+  projects are not special-cased: they are still probed through the picker.
+- On startup the catalog preloads once, the first time a local
+  `AgentPanel` exists while AI is enabled: `observe_new::<AgentPanel>`
+  runs inside the panel's own `entity.update`, where reading the panel
+  entity would panic, so the callback only inspects the passed `&mut`
+  panel (and other entities) and defers the rest via `App::defer`. The
+  deferred step re-checks `AgentRegistryStore::is_fetching`; while the
+  initial fetch is still running the panel is recorded as the candidate
+  and a single `App::observe` subscription waits for the fetch-finished
+  notification, which defers again into `start_preload`. A registry store
+  that never existed takes the same deferred path and starts immediately.
+  A dropped candidate panel retries through the next `AgentPanel`.
 - Probing an agent with no open session creates a throwaway ACP session
   (no `ConversationView`, sidebar entry, or visible `ThreadMetadataStore`
   row) to read its model list. The whole probe — the pending connection
@@ -177,24 +189,33 @@ open `AgentPanel` sessions or short-lived probe sessions.
   late-resolving session is closed but its result is discarded, and a
   timed-out `Failed` entry is retried on the next refresh against the same
   pending `AgentConnectionStore` entry.
-- Probe sessions are torn down via `close_session` (when
-  `supports_close_session`) and `delete_session` (when the agent's session
-  list supports deletion). When the agent cannot delete the session, a
-  `ThreadMetadata` row is written with `archived: true` so the leftover
-  session stays out of the sidebar and the Import Thread list.
+- Probe-session cleanup: `close_session` when `supports_close_session`,
+  then `delete_session` when the agent's session list exists and supports
+  deletion. No metadata is written when the agent has no session list (the
+  session can never surface in Import Thread) or when deletion succeeds.
+  A `ThreadMetadata` row with `archived: true` and title
+  `PROBE_SESSION_TITLE` is written only when a session list exists and the
+  session cannot be deleted (`delete_session` unsupported or failed), so
+  the leftover session stays out of the sidebar and Import Thread.
+- `ThreadsArchiveView` filters archived probe rows (`title ==
+  PROBE_SESSION_TITLE`) out of `update_items` and out of both
+  "has archived threads" checks, so persisted probe rows stay in storage
+  (old rows must not be deleted — deleting them would let the session
+  resurface in Import Thread) but never appear in the Archive list.
 - **Approved limitation:** cataloged external models are not applied to
   external sessions. The Agent Profiles settings page persists the
   selection through the existing `LanguageModelSelection` `default_model`
   profile field with `provider = <AgentId>`; nothing reads that field for
   external agents yet.
-- States `Ready`/`AuthRequired`/`Loading` are not reprobed on subsequent
-  refreshes; `Failed` is retried.
+- **Approved limitation (F8):** an agent whose settings, registry version,
+  or installation changes mid-session keeps its stale catalog entry (and
+  any persisted probe-session metadata rows may remain in history) until
+  the next application start re-runs the preload.
 
 **Upstream code to re-check on upstream updates.**
 
-- `AgentConnectionStore::request_connection` /
-  `AgentConnectionStore::handle_agent_servers_updated` — the catalog relies
-  on pending-entry reuse and on server updates clearing stale entries.
+- `AgentConnectionStore::request_connection` — the catalog relies on
+  pending-entry reuse for timeout retries.
 - `ConversationView::initial_state` — `is_via_collab` gating,
   `default_path_list` work dirs, and `AuthRequired::from_error`
   classification must keep matching how sessions are normally opened.
@@ -207,19 +228,29 @@ open `AgentPanel` sessions or short-lived probe sessions.
   capability checks.
 - `thread_import.rs` — where leftover probe sessions appear in
   history/import listings.
-- Emitters of `AgentServersUpdated` — catalog invalidation depends on it
-  firing whenever the installed-agent set changes.
+- `ThreadsArchiveView::update_items` and its `archived_entries()` checks —
+  upstream changes to how archived rows are listed or counted must keep
+  the `is_probe_session_metadata` filter intact.
 
 **Verification.**
 
-- `cargo test -p project external_agent_models` — 4 tests (no source,
-  single source call + notifications, `AgentServersUpdated` clear,
-  released-project purge).
-- `cargo test -p agent_ui external_agent_models` — 16 tests (config-option
-  extraction, selector fallback, auth, connect/session timeout + late
-  cleanup, `AgentServersUpdated` mid-probe discard, loading-skip,
-  open-session reuse, retry rules, close/delete, no side effects, collab +
-  missing-panel messages).
+- `cargo test -p project external_agent_models` — 4 tests (no source
+  returns none, single source call + catalog notifications, app-wide
+  sharing across projects, `AgentServersUpdated` ignored incl. agent
+  removal).
+- `cargo test -p agent_ui external_agent_models` — 28 tests (config-option
+  and selector extraction, auth classification, connect/session timeout +
+  late-session cleanup, loading-skip, open-session reuse without
+  `session/new`, stable/`Failed` retry rules, `AgentServersUpdated`
+  mid-probe and steady-state being ignored, close + delete cleanup,
+  archive on undeletable or failed delete, no metadata without a session
+  list, no UI/session mutation, collab / no-panel / `disable_ai` refresh
+  no-ops preserving state, preload once-per-run, preload waiting on the
+  registry fetch, preload on a ready or absent registry, `disable_ai` /
+  non-local / dropped-panel preload skips).
+- `cargo test -p agent_ui threads_archive_view` — probe rows hidden under
+  both filters; probe-only storage renders the empty state and falls back
+  to the All filter.
 - `./script/clippy` — clean.
 
 **Upstream revision last verified:** `83323324a4`.

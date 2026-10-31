@@ -3,6 +3,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use crate::agent_connection_store::AgentConnectionStore;
+use crate::external_agent_models::PROBE_SESSION_TITLE;
 
 use crate::thread_metadata_store::{
     ThreadId, ThreadMetadata, ThreadMetadataStore, worktree_info_from_thread_paths,
@@ -61,6 +62,13 @@ enum ArchiveListItem {
         thread: ThreadMetadata,
         highlight_positions: Vec<usize>,
     },
+}
+
+/// Archived metadata for a model-list probe session. The row stays persisted
+/// so the session cannot resurface in Import Thread, but it is not a real
+/// user thread and is never listed here.
+fn is_probe_session_metadata(metadata: &ThreadMetadata) -> bool {
+    metadata.archived && metadata.title.as_deref() == Some(PROBE_SESSION_TITLE)
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -275,7 +283,9 @@ impl ThreadsArchiveView {
         // user just deleted the last one), fall back to showing all threads
         // so they aren't stranded with an empty list and a disabled toggle.
         if self.thread_filter == ThreadFilter::ArchivedOnly
-            && store.archived_entries().next().is_none()
+            && store
+                .archived_entries()
+                .all(|entry| is_probe_session_metadata(entry))
         {
             self.thread_filter = ThreadFilter::All;
         }
@@ -283,6 +293,7 @@ impl ThreadsArchiveView {
         let thread_filter = self.thread_filter;
         let sessions = store
             .entries()
+            .filter(|t| !is_probe_session_metadata(t))
             .filter(|t| match thread_filter {
                 ThreadFilter::All => true,
                 ThreadFilter::ArchivedOnly => t.archived,
@@ -961,7 +972,9 @@ impl ThreadsArchiveView {
 
         let has_archived_threads = {
             let store = ThreadMetadataStore::global(cx).read(cx);
-            store.archived_entries().next().is_some()
+            store
+                .archived_entries()
+                .any(|entry| !is_probe_session_metadata(entry))
         };
 
         let count_label = if entry_count == 1 {
@@ -1648,6 +1661,13 @@ impl PickerDelegate for ProjectPickerDelegate {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
+
+    use fs::FakeFs;
+    use gpui::{TestAppContext, VisualTestContext};
+    use project::{Project, WorktreePaths};
+    use workspace::MultiWorkspace;
+
     use super::*;
 
     #[test]
@@ -1699,5 +1719,143 @@ mod tests {
                 "position {pos} is not a valid UTF-8 boundary in {text:?}"
             );
         }
+    }
+
+    fn init_view_test(cx: &mut TestAppContext, fs: Arc<FakeFs>) {
+        crate::test_support::init_test(cx);
+        cx.update(|cx| {
+            <dyn fs::Fs>::set_global(fs, cx);
+            language_model::LanguageModelRegistry::test(cx);
+            agent::ThreadStore::init_global(cx);
+            crate::thread_metadata_store::init(cx);
+        });
+    }
+
+    fn archived_metadata(title: &str) -> ThreadMetadata {
+        let now = Utc::now();
+        ThreadMetadata {
+            thread_id: ThreadId::new(),
+            session_id: Some(acp::SessionId::new(format!("session-{title}"))),
+            agent_id: AgentId::new("catalog-agent"),
+            title: Some(title.into()),
+            title_override: None,
+            updated_at: now,
+            created_at: Some(now),
+            interacted_at: None,
+            worktree_paths: WorktreePaths::from_folder_paths(&PathList::new(&["/worktree"])),
+            remote_connection: None,
+            archived: true,
+        }
+    }
+
+    fn visible_entry_titles(
+        view: &Entity<ThreadsArchiveView>,
+        cx: &mut VisualTestContext,
+    ) -> Vec<String> {
+        view.read_with(cx, |view, _cx| {
+            view.items
+                .iter()
+                .filter_map(|item| match item {
+                    ArchiveListItem::Entry { thread, .. } => {
+                        thread.title.as_ref().map(|title| title.to_string())
+                    }
+                    _ => None,
+                })
+                .collect()
+        })
+    }
+
+    async fn setup_archive_view(
+        cx: &mut TestAppContext,
+    ) -> (
+        Entity<Workspace>,
+        Entity<ThreadsArchiveView>,
+        VisualTestContext,
+    ) {
+        let fs = FakeFs::new(cx.executor());
+        init_view_test(cx, fs.clone());
+        let project = Project::test(fs, [], cx).await;
+
+        let window_handle =
+            cx.add_window(|window, cx| MultiWorkspace::test_new(project.clone(), window, cx));
+        let multi_workspace = window_handle
+            .root(cx)
+            .expect("MultiWorkspace root should exist");
+        let workspace = multi_workspace.read_with(cx, |multi_workspace, _cx| {
+            multi_workspace.workspace().clone()
+        });
+        let app_state = workspace.read_with(cx, |workspace, _cx| workspace.app_state().clone());
+        cx.update(|cx| workspace::AppState::set_global(app_state, cx));
+
+        let mut visual_cx = VisualTestContext::from_window(window_handle.into(), cx);
+        let cx = &mut visual_cx;
+        let connection_store =
+            cx.update(|_window, cx| cx.new(|cx| AgentConnectionStore::new(project.clone(), cx)));
+        let server_store =
+            project.read_with(cx, |project, _cx| project.agent_server_store().clone());
+        let view = cx.update(|window, cx| {
+            cx.new(|cx| {
+                ThreadsArchiveView::new(
+                    workspace.downgrade(),
+                    connection_store.downgrade(),
+                    server_store.downgrade(),
+                    window,
+                    cx,
+                )
+            })
+        });
+        (workspace, view, visual_cx)
+    }
+
+    fn save_archived_metadata(metadata: ThreadMetadata, cx: &mut VisualTestContext) {
+        cx.update(|_window, cx| {
+            ThreadMetadataStore::global(cx).update(cx, |store, cx| store.save(metadata, cx));
+        });
+    }
+
+    #[gpui::test]
+    async fn probe_sessions_are_hidden_from_archive_view(cx: &mut TestAppContext) {
+        let (workspace, view, mut cx) = setup_archive_view(cx).await;
+        let _ = workspace;
+        let cx = &mut cx;
+
+        save_archived_metadata(archived_metadata(PROBE_SESSION_TITLE), cx);
+        save_archived_metadata(archived_metadata("An old thread"), cx);
+        cx.run_until_parked();
+
+        // The probe row stays persisted but is never listed — neither under
+        // All nor under ArchivedOnly.
+        assert_eq!(visible_entry_titles(&view, cx), vec!["An old thread"]);
+
+        view.update(cx, |view, cx| {
+            view.thread_filter = ThreadFilter::ArchivedOnly;
+            view.update_items(cx);
+        });
+        assert_eq!(visible_entry_titles(&view, cx), vec!["An old thread"]);
+        view.read_with(cx, |view, _cx| {
+            assert_eq!(view.thread_filter, ThreadFilter::ArchivedOnly);
+        });
+    }
+
+    #[gpui::test]
+    async fn archive_view_is_empty_when_only_probe_sessions_exist(cx: &mut TestAppContext) {
+        let (workspace, view, mut cx) = setup_archive_view(cx).await;
+        let _ = workspace;
+        let cx = &mut cx;
+
+        save_archived_metadata(archived_metadata(PROBE_SESSION_TITLE), cx);
+        cx.run_until_parked();
+
+        // Probe-only storage produces no items: the view renders its empty
+        // state and the archived-only filter falls back to All.
+        view.read_with(cx, |view, _cx| assert!(view.items.is_empty()));
+        view.update(cx, |view, cx| {
+            view.thread_filter = ThreadFilter::ArchivedOnly;
+            view.update_items(cx);
+        });
+        view.read_with(cx, |view, _cx| {
+            assert_eq!(view.thread_filter, ThreadFilter::All);
+            assert!(view.items.is_empty());
+        });
     }
 }
